@@ -1,7 +1,13 @@
 import React, { useMemo } from "react";
 import { BarChart3 } from "@langfuse/icons";
 import { type DashboardWidgetChartType } from "@langfuse/shared/src/db";
-import { Chart } from "@/src/features/widgets/chart-library/Chart";
+import { usePreparedWidgetChart } from "@/src/features/widgets/components/usePreparedWidgetChart";
+import { VisualizationFrame } from "@/src/components/design-system/charts/internal/VisualizationFrame/VisualizationFrame";
+import {
+  useLargeDatasetGuard,
+  LARGE_DATASET_CONFIRMATION,
+} from "@/src/features/widgets/chart-library/useLargeDatasetGuard";
+import { isChartDataEmpty } from "@/src/features/widgets/chart-library/isChartDataEmpty";
 import type {
   DataPoint,
   ChartProps,
@@ -23,12 +29,19 @@ function buildChartConfig(data: DataPoint[], metricLabel: string) {
   // (e.g. an observation/model named "metric") keeps its own label.
   for (const point of data) {
     if (point.dimension && config[point.dimension] === undefined) {
-      config[point.dimension] = { label: point.dimension };
+      config[point.dimension] = {
+        label: point.dimension,
+        theme: { light: "hsl(var(--chart-1))", dark: "hsl(var(--chart-1))" },
+      };
     }
   }
   // Reserved key the bar/pie primitives colour through `--color-metric`; only
   // add it if no real series already claimed the "metric" key above.
-  if (config.metric === undefined) config.metric = { label: metricLabel };
+  if (config.metric === undefined)
+    config.metric = {
+      label: metricLabel,
+      theme: { light: "hsl(var(--chart-1))", dark: "hsl(var(--chart-1))" },
+    };
   return config;
 }
 
@@ -68,8 +81,31 @@ export const ChartCanvas = React.memo(function ChartCanvas({
     () => buildChartConfig(data, metricLabel),
     [data, metricLabel],
   );
+  const { shouldWarn, proceed } = useLargeDatasetGuard(data.length, false);
 
-  if (data.length === 0) {
+  // Match dashboard widgets: only additive metrics fill missing buckets with zero.
+  const prepared = usePreparedWidgetChart({
+    chartType,
+    data,
+    active: !shouldWarn && !isChartDataEmpty(data),
+    rowLimit: RANKED_ROW_LIMIT,
+    unit: metricUnit,
+    config: chartConfig,
+    legendPosition:
+      isTimeSeriesChartType(chartType) && breakdown !== "none"
+        ? ("below" as const)
+        : ("none" as const),
+    missingValue: getWidgetMissingBucketValue(aggregation),
+  });
+
+  if (shouldWarn)
+    return (
+      <VisualizationFrame
+        content={{ ...LARGE_DATASET_CONFIRMATION, onConfirm: proceed }}
+      />
+    );
+
+  if (isChartDataEmpty(data)) {
     return (
       <div className="text-muted-foreground flex h-full flex-col items-center justify-center gap-2 p-8 text-center">
         <BarChart3 __rawClassName="h-10 w-10 opacity-40" />
@@ -78,25 +114,19 @@ export const ChartCanvas = React.memo(function ChartCanvas({
     );
   }
 
-  // Show the series legend only for a multi-series time chart. The shared
-  // chart-library renders the legend below the plot now (LFE-10576), so "below"
-  // is the value that used to be "above" here.
-  const isTimeSeries = isTimeSeriesChartType(chartType);
-  const legendPosition =
-    isTimeSeries && breakdown !== "none" ? "below" : "none";
-
-  return (
-    <Chart
-      chartType={chartType}
-      data={data}
-      rowLimit={RANKED_ROW_LIMIT}
-      chartConfig={{ type: chartType, unit: metricUnit }}
-      config={chartConfig}
-      legendPosition={legendPosition}
-      // Match dashboard widgets: additive metrics (count/sum) fill an empty
-      // bucket with a 0 (continuous line), non-additive ones leave a gap — so a
-      // chart renders the same here as once saved to a dashboard.
-      missingValue={getWidgetMissingBucketValue(aggregation)}
-    />
-  );
+  const { visualization } = prepared;
+  if (visualization.type === "table" && !visualization.rows.length) {
+    return (
+      <div
+        className="text-muted-foreground flex h-full items-center justify-center text-sm"
+        role="alert"
+      >
+        Unable to process data for pivot table
+      </div>
+    );
+  }
+  if (visualization.type === "histogram" && !visualization.data.length) {
+    return <VisualizationFrame content={{ type: "empty" }} />;
+  }
+  return <VisualizationFrame {...prepared} content={prepared.visualization} />;
 });

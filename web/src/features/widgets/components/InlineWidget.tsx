@@ -1,6 +1,13 @@
 /* eslint-disable no-nested-ternary, @repo/component-file-structure */
 /* eslint-disable @repo/no-style-props */
-import { useMemo, useState, useCallback, type ReactNode } from "react";
+import {
+  useMemo,
+  useState,
+  useCallback,
+  type ReactNode,
+  type ComponentProps,
+} from "react";
+import { type WidgetChartCard } from "./WidgetChartCard";
 import { type DashboardWidgetChartType } from "@langfuse/shared/src/db";
 import { type OrderByState } from "@langfuse/shared";
 import {
@@ -9,12 +16,21 @@ import {
   getResultUnit,
 } from "@langfuse/shared/query";
 import { useScheduledDashboardExecuteQuery } from "@/src/features/dashboard/hooks/DashboardQuerySchedulerProvider";
-import { Chart } from "@/src/features/widgets/chart-library/Chart";
+import { type ChartProps } from "../chart-library/chart-props";
+import { usePreparedWidgetChart } from "./usePreparedWidgetChart";
+import {
+  VisualizationFrame,
+  type Visualization,
+} from "@/src/components/design-system/charts/internal/VisualizationFrame/VisualizationFrame";
+import {
+  useLargeDatasetGuard,
+  LARGE_DATASET_CONFIRMATION,
+} from "@/src/features/widgets/chart-library/useLargeDatasetGuard";
+import { isChartDataEmpty } from "@/src/features/widgets/chart-library/isChartDataEmpty";
 import {
   type FormatMetricOptions,
   type LegendPosition,
 } from "@/src/features/widgets/chart-library/chart-props";
-import { ChartLoadingState } from "@/src/features/widgets/chart-library/ChartLoadingState";
 import {
   getChartLoadingProgress,
   getChartLoadingStateProps,
@@ -115,7 +131,7 @@ export type WidgetContentProps = WidgetQuerySource & {
   zeroBaseline?: boolean;
   /**
    * Replaces the chart's default "No data" card — for a widget in a band too
-   * short for it. Pass a stable node (see `Chart`).
+   * short for it.
    */
   emptyState?: ReactNode;
   usdPrecision?: FormatMetricOptions["usdPrecision"];
@@ -137,17 +153,17 @@ const getXAxisValue = (
 };
 
 /**
- * Core widget content: executes query, transforms data, renders chart with loading states.
+ * Shared query preparation for inline charts and connected chart cards.
  *
  * This component handles:
  * - Query execution via useScheduledDashboardExecuteQuery
  * - Data transformation for chart consumption (time_dimension, entity_dimension, dimension, metric)
- * - Chart rendering with the appropriate chart type
+ * - Chart props for the appropriate chart type
  * - Loading and error states
  *
  * For pivot tables, pass sortState and onSortChange to enable sorting.
  */
-export function WidgetContent({
+export function useWidgetChart({
   projectId,
   fetchQuery,
   query,
@@ -160,19 +176,37 @@ export function WidgetContent({
   // equals widget is pending
   isExternalLoading = false,
   schedulerId,
-  layoutHint = "default",
   sortState,
   onSortChange,
-  className,
   entityDimensionLabelMap,
   dimensionLabelMap,
   hideXAxisLabels,
   colorBarsByCategory,
   legendPosition,
   zeroBaseline,
-  emptyState,
   usdPrecision,
-}: WidgetContentProps) {
+}: WidgetQuerySource &
+  Pick<
+    WidgetContentProps,
+    | "query"
+    | "version"
+    | "chartType"
+    | "chartConfig"
+    | "metrics"
+    | "dimensions"
+    | "view"
+    | "isExternalLoading"
+    | "schedulerId"
+    | "sortState"
+    | "onSortChange"
+    | "entityDimensionLabelMap"
+    | "dimensionLabelMap"
+    | "hideXAxisLabels"
+    | "colorBarsByCategory"
+    | "legendPosition"
+    | "zeroBaseline"
+    | "usdPrecision"
+  >) {
   // Transport-only: `version` is a prop here, so an unresolved session can
   // never change WHAT is queried — only whether it streams (SSE) or not.
   const { isV4 } = useReadPath();
@@ -404,7 +438,9 @@ export function WidgetContent({
   }, [chartType, chartConfig.row_limit]);
 
   // Build chart config with units
-  const fullChartConfig = useMemo(() => {
+  const fullChartConfig = useMemo<
+    NonNullable<ComponentProps<typeof WidgetChartCard>["chartConfig"]>
+  >(() => {
     const baseConfig = { ...chartConfig };
 
     if (chartType === "PIVOT_TABLE") {
@@ -428,47 +464,125 @@ export function WidgetContent({
     return baseConfig;
   }, [chartConfig, chartType, dimensions, metrics, view, version]);
 
-  if (isExternalLoading) {
+  return {
+    chartProps: {
+      chartType,
+      data: transformedData,
+      config: chartPresentation
+        ? { metric: { label: chartPresentation.label } }
+        : undefined,
+      rowLimit: effectiveRowLimit,
+      chartConfig: fullChartConfig,
+      sortState: chartType === "PIVOT_TABLE" ? sortState : undefined,
+      onSortChange: chartType === "PIVOT_TABLE" ? onSortChange : undefined,
+      isLoading: queryResult.isPending || isExternalLoading,
+      metricFormatter: chartPresentation?.metricFormatter,
+      missingValue: getWidgetMissingBucketValue(metrics[0]?.agg ?? "count"),
+      hideXAxisLabels,
+      colorBarsByCategory,
+      legendPosition,
+      zeroBaseline,
+    } satisfies ChartProps &
+      Pick<
+        ComponentProps<typeof WidgetChartCard>,
+        "chartType" | "rowLimit" | "chartConfig" | "sortState" | "onSortChange"
+      > & {
+        isLoading: boolean;
+      },
+    chartLoadingState,
+    loadingProgress,
+    onRetry: queryResult.isError ? handleRetry : undefined,
+  };
+}
+
+export function WidgetContent(props: WidgetContentProps) {
+  const { chartProps, chartLoadingState, loadingProgress, onRetry } =
+    useWidgetChart(props);
+  const { isLoading, ...chart } = chartProps;
+  const { shouldWarn, proceed } = useLargeDatasetGuard(
+    chart.data.length,
+    false,
+  );
+  const showEmpty =
+    (isTimeSeriesChart(chart.chartType) ||
+      chart.chartType === "NUMBER" ||
+      chart.chartType === "HISTOGRAM" ||
+      chart.chartType === "PIVOT_TABLE" ||
+      props.emptyState !== undefined) &&
+    (chart.chartType === "NUMBER" || !isLoading) &&
+    isChartDataEmpty(chart.data);
+
+  const prepared = usePreparedWidgetChart({
+    ...chart,
+    active: !props.isExternalLoading && !shouldWarn && !showEmpty,
+  });
+  const content: Visualization = (() => {
+    const { visualization } = prepared;
+    if (visualization.type === "table" && !visualization.rows.length) {
+      if (isLoading) return { type: "loading", progress: loadingProgress };
+      return {
+        type: "error",
+        message: "Unable to process data for pivot table",
+      };
+    }
+    if (visualization.type === "histogram" && !visualization.data.length)
+      return { type: "empty", message: "No data available" };
+    return visualization;
+  })();
+
+  if (props.isExternalLoading) {
     return (
-      <div className="bg-background flex items-center justify-center rounded-lg border p-4">
-        <div className="text-muted-foreground">Loading...</div>
-      </div>
+      <VisualizationFrame
+        content={{
+          type: "loading",
+          progress: { type: "spinner" },
+          layout: props.layoutHint ?? "default",
+        }}
+      />
     );
   }
 
   return (
-    <div className={cn("relative min-h-0 flex-1", className)}>
-      <Chart
-        chartType={chartType}
-        data={transformedData}
-        config={
-          chartPresentation
-            ? { metric: { label: chartPresentation.label } }
-            : undefined
-        }
-        rowLimit={effectiveRowLimit}
-        chartConfig={fullChartConfig}
-        sortState={chartType === "PIVOT_TABLE" ? sortState : undefined}
-        onSortChange={chartType === "PIVOT_TABLE" ? onSortChange : undefined}
-        isLoading={queryResult.isPending || isExternalLoading}
-        metricFormatter={chartPresentation?.metricFormatter}
-        missingValue={getWidgetMissingBucketValue(metrics[0]?.agg ?? "count")}
-        hideXAxisLabels={hideXAxisLabels}
-        colorBarsByCategory={colorBarsByCategory}
-        legendPosition={legendPosition}
-        zeroBaseline={zeroBaseline}
-        emptyState={emptyState}
-      />
-      {chartLoadingState.isLoading && (
-        <ChartLoadingState
-          showSpinner={chartLoadingState.showSpinner}
-          showHintImmediately={chartLoadingState.showHintImmediately}
-          hintText={chartLoadingState.hintText}
-          onRetry={queryResult.isError ? handleRetry : undefined}
-          progress={loadingProgress}
-          layout={layoutHint}
-          className="bg-background/80 absolute inset-0 z-20 backdrop-blur-xs"
+    <div className={cn("relative min-h-0 flex-1", props.className)}>
+      {shouldWarn && (
+        <VisualizationFrame
+          content={{ ...LARGE_DATASET_CONFIRMATION, onConfirm: proceed }}
         />
+      )}
+      {!shouldWarn &&
+        showEmpty &&
+        (props.emptyState ?? (
+          <VisualizationFrame
+            content={
+              isLoading
+                ? { type: "loading", progress: { type: "spinner" } }
+                : { type: "empty" }
+            }
+          />
+        ))}
+      {!shouldWarn && !showEmpty && <VisualizationFrame content={content} />}
+      {chartLoadingState.isLoading && (
+        <div className="bg-background/80 absolute inset-0 z-20 backdrop-blur-xs">
+          <VisualizationFrame
+            content={
+              chartLoadingState.showSpinner
+                ? {
+                    type: "loading",
+                    showHintImmediately: chartLoadingState.showHintImmediately,
+                    hintText: chartLoadingState.hintText,
+                    progress: loadingProgress,
+                    layout: props.layoutHint ?? "default",
+                  }
+                : {
+                    type: "error",
+                    message:
+                      chartLoadingState.hintText ?? "Unable to load chart data",
+                    onRetry,
+                    layout: props.layoutHint ?? "default",
+                  }
+            }
+          />
+        </div>
       )}
     </div>
   );

@@ -1,4 +1,5 @@
 import { useMemo, type ComponentProps } from "react";
+import { type WidgetChartCard } from "./WidgetChartCard";
 import {
   Card,
   CardContent,
@@ -10,10 +11,18 @@ import { Alert } from "@/src/components/design-system/Alert/Alert";
 import { AlertCircle } from "@langfuse/icons";
 import { api } from "@/src/utils/api";
 import { getResultUnit } from "@langfuse/shared/query";
-import { Chart } from "@/src/features/widgets/chart-library/Chart";
+import { usePreparedWidgetChart } from "./usePreparedWidgetChart";
+import {
+  VisualizationFrame,
+  type Visualization,
+} from "@/src/components/design-system/charts/internal/VisualizationFrame/VisualizationFrame";
+import {
+  useLargeDatasetGuard,
+  LARGE_DATASET_CONFIRMATION,
+} from "@/src/features/widgets/chart-library/useLargeDatasetGuard";
+import { isChartDataEmpty } from "@/src/features/widgets/chart-library/isChartDataEmpty";
 import { type DataPoint } from "@/src/features/widgets/chart-library/chart-props";
 import { isTimeSeriesChart } from "@/src/features/widgets/chart-library/utils";
-import { ChartLoadingState } from "@/src/features/widgets/chart-library/ChartLoadingState";
 import {
   getChartLoadingProgress,
   getChartLoadingStateProps,
@@ -67,7 +76,21 @@ export function ConnectedWidgetPreview(props: ConnectedWidgetPreviewProps) {
     chartPresentation,
   } = useWidgetPreviewData(props);
 
-  const chartConfig: ComponentProps<typeof Chart>["chartConfig"] = (() => {
+  const { shouldWarn, proceed } = useLargeDatasetGuard(
+    transformedData.length,
+    false,
+  );
+  const showEmpty =
+    (isTimeSeriesChart(chartType) ||
+      chartType === "NUMBER" ||
+      chartType === "HISTOGRAM" ||
+      chartType === "PIVOT_TABLE") &&
+    (chartType === "NUMBER" || !queryResult.isPending) &&
+    isChartDataEmpty(transformedData);
+
+  const chartConfig: NonNullable<
+    ComponentProps<typeof WidgetChartCard>["chartConfig"]
+  > = (() => {
     if (chartType === "PIVOT_TABLE") {
       return {
         type: chartType,
@@ -111,6 +134,37 @@ export function ConnectedWidgetPreview(props: ConnectedWidgetPreviewProps) {
     };
   })();
 
+  const active =
+    queryValidation.valid &&
+    Boolean(queryResult.data || chartLoadingState.isLoading) &&
+    !shouldWarn &&
+    !showEmpty;
+  const prepared = usePreparedWidgetChart({
+    chartType,
+    data: transformedData,
+    chartConfig,
+    rowLimit: values.chart.rowLimit,
+    active,
+    label: chartPresentation?.label,
+    metricFormatter: chartPresentation?.metricFormatter,
+    missingValue: getWidgetMissingBucketValue(selectedAggregation),
+    sortState: chartType === "PIVOT_TABLE" ? previewSortState : undefined,
+  });
+  const content: Visualization = (() => {
+    const { visualization } = prepared;
+    if (visualization.type === "table" && !visualization.rows.length) {
+      if (queryResult.isPending)
+        return { type: "loading", progress: loadingProgress };
+      return {
+        type: "error",
+        message: "Unable to process data for pivot table",
+      };
+    }
+    if (visualization.type === "histogram" && !visualization.data.length)
+      return { type: "empty", message: "No data available" };
+    return visualization;
+  })();
+
   return (
     <div className="w-2/3">
       <Card className="flex aspect-video flex-col">
@@ -140,34 +194,47 @@ export function ConnectedWidgetPreview(props: ConnectedWidgetPreviewProps) {
           (queryResult.data || chartLoadingState.isLoading) && (
             <div className="flex min-h-0 flex-1 flex-col">
               <div className="relative min-h-0 flex-1">
-                <Chart
-                  chartType={chartType}
-                  data={transformedData}
-                  config={
-                    chartPresentation
-                      ? { metric: { label: chartPresentation.label } }
-                      : undefined
-                  }
-                  rowLimit={values.chart.rowLimit}
-                  chartConfig={chartConfig}
-                  sortState={
-                    chartType === "PIVOT_TABLE" ? previewSortState : undefined
-                  }
-                  onSortChange={undefined}
-                  isLoading={queryResult.isPending}
-                  metricFormatter={chartPresentation?.metricFormatter}
-                  missingValue={getWidgetMissingBucketValue(
-                    selectedAggregation,
-                  )}
-                />
-                {chartLoadingState.isLoading && (
-                  <ChartLoadingState
-                    showSpinner={chartLoadingState.showSpinner}
-                    showHintImmediately={chartLoadingState.showHintImmediately}
-                    hintText={chartLoadingState.hintText}
-                    progress={loadingProgress}
-                    className="bg-background/80 absolute inset-0 z-20 backdrop-blur-xs"
+                {shouldWarn && (
+                  <VisualizationFrame
+                    content={{
+                      ...LARGE_DATASET_CONFIRMATION,
+                      onConfirm: proceed,
+                    }}
                   />
+                )}
+                {!shouldWarn && showEmpty && (
+                  <VisualizationFrame
+                    content={
+                      queryResult.isPending
+                        ? { type: "loading", progress: { type: "spinner" } }
+                        : { type: "empty" }
+                    }
+                  />
+                )}
+                {!shouldWarn && !showEmpty && (
+                  <VisualizationFrame content={content} />
+                )}
+                {chartLoadingState.isLoading && (
+                  <div className="bg-background/80 absolute inset-0 z-20 backdrop-blur-xs">
+                    <VisualizationFrame
+                      content={
+                        chartLoadingState.showSpinner
+                          ? {
+                              type: "loading",
+                              showHintImmediately:
+                                chartLoadingState.showHintImmediately,
+                              hintText: chartLoadingState.hintText,
+                              progress: loadingProgress,
+                            }
+                          : {
+                              type: "error",
+                              message:
+                                chartLoadingState.hintText ??
+                                "Unable to load chart data",
+                            }
+                      }
+                    />
+                  </div>
                 )}
               </div>
             </div>
@@ -177,9 +244,9 @@ export function ConnectedWidgetPreview(props: ConnectedWidgetPreviewProps) {
           !chartLoadingState.isLoading && (
             <CardContent>
               <div className="flex h-[300px] items-center justify-center">
-                <p className="text-muted-foreground">
-                  Waiting for Input / Loading...
-                </p>
+                <VisualizationFrame
+                  content={{ type: "empty", message: "Waiting for input" }}
+                />
               </div>
             </CardContent>
           )}
